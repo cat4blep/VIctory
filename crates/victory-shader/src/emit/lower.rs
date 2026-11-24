@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
-use super::container::SigElement;
+use super::container::{BARYCENTRICS, SigElement};
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
@@ -132,6 +132,9 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    // Only direct reads need extra system inputs; raised interpolations
+    // already refer to the corresponding pixel attribute.
+    barycentric_inputs: HashMap<Value, (Barycentric, u8)>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -434,6 +437,7 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
+            barycentric_inputs: HashMap::new(),
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -906,6 +910,10 @@ impl<'a> Lower<'a> {
     fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
         for &(reg, v) in &self.x.p.inputs {
+            if let Some(&Input::Barycentric { kind, index }) = io_inputs.get(&v) {
+                self.barycentric_inputs.insert(v, (kind, index));
+                continue;
+            }
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(_) => match io_inputs.get(&v) {
@@ -936,7 +944,6 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1005,6 +1012,54 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Add the host rasterizer's system input only if I or J is used directly.
+    fn barycentric_input(&mut self, kind: Barycentric, index: u8) -> Result<Val, Why> {
+        let (interp, perspective) = match kind {
+            Barycentric::PerspectiveCenter => (2, true),
+            Barycentric::PerspectiveCentroid => (3, true),
+            Barycentric::PerspectiveSample => (6, true),
+            Barycentric::LinearCenter => (4, false),
+            Barycentric::LinearCentroid => (5, false),
+            Barycentric::LinearSample => (7, false),
+            Barycentric::PerspectivePullModel => return Err("direct pull-model barycentrics"),
+        };
+        let mut barycentrics = self
+            .s
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == BARYCENTRICS);
+        let id = match barycentrics.find(|(_, e)| matches!(e.interp, 2 | 3 | 6) == perspective) {
+            Some((id, e)) if e.interp == interp => id,
+            Some(_) => return Err("two direct barycentric inputs with the same perspective mode"),
+            None => {
+                let index = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter(|e| e.kind == BARYCENTRICS)
+                    .count() as u32;
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index,
+                    kind: BARYCENTRICS,
+                    comp: 9,
+                    interp,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        // P0 + I*(P1-P0) + J*(P2-P0) corresponds to host weights
+        // (1-I-J, I, J).
+        Ok(self.load_input(id, index + 1))
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -1092,6 +1147,11 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
+        }
+        if let Some(&(kind, index)) = self.barycentric_inputs.get(&v) {
+            let val = self.barycentric_input(kind, index)?;
+            self.vals.insert(v, val);
+            return Ok(val);
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
@@ -6516,7 +6576,14 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let x = match (self.vals.get(&arg).copied(), bit) {
+                let val = if self.read_phis.contains(&phi.value)
+                    && self.barycentric_inputs.contains_key(&arg)
+                {
+                    Some(self.get(arg).unwrap_or_else(Val::Missing))
+                } else {
+                    self.vals.get(&arg).copied()
+                };
+                let x = match (val, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
