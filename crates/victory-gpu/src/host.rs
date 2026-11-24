@@ -1478,9 +1478,9 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     #[cfg(feature = "diagnostics")]
-    depth_upload: Option<crate::present_depth::PreviewUpload>,
+    preview_upload: Option<crate::present_depth::PreviewUpload>,
     #[cfg(feature = "diagnostics")]
-    saved_depth_frames: u8,
+    saved_preview_frames: [u8; 2],
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1507,7 +1507,7 @@ impl Meter {
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND, depth_preview: bool) {
+    fn frame(&mut self, hwnd: HWND, preview_color: Option<bool>) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
@@ -1567,7 +1567,11 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let mode = if depth_preview { " [depth preview]" } else { "" };
+        let mode = match preview_color {
+            Some(true) => " [color preview]",
+            Some(false) => " [depth preview]",
+            None => "",
+        };
         let text = format!(" | VIctory{mode} {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
@@ -1630,7 +1634,7 @@ impl Host {
                     (p.width, p.height, p.format) = (width, height, format);
                     #[cfg(feature = "diagnostics")]
                     {
-                        p.depth_upload = None;
+                        p.preview_upload = None;
                     }
                 }
                 Err(e) => {
@@ -1640,26 +1644,29 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        let new_depth = if let Some(image) = crate::capture::scene_depth_preview()
-            && p.depth_upload
-                .as_ref()
-                .is_none_or(|upload| upload.frame != image.frame)
-            && let Some(upload) =
-                crate::present_depth::PreviewUpload::new(self, width, height, format, &image)
+        let new_preview = match crate::scene_color::preview(frame)
+            .or_else(crate::capture::scene_depth_preview)
         {
-            p.depth_upload = Some(upload);
-            Some(image.frame)
-        } else {
-            None
+            Some(image) if p.preview_upload.as_ref().is_none_or(|upload|
+                (upload.frame, upload.color) != (image.frame, image.color)) => {
+                p.preview_upload =
+                    crate::present_depth::PreviewUpload::new(self, width, height, format, &image);
+                p.preview_upload.as_ref().map(|upload| (upload.frame, upload.color))
+            }
+            Some(_) => None,
+            None => {
+                p.preview_upload = None;
+                None
+            }
         };
         #[cfg(feature = "diagnostics")]
-        let show_depth = p.depth_upload.is_some();
+        let shown_preview = p.preview_upload.as_ref().map(|upload| upload.color);
         #[cfg(not(feature = "diagnostics"))]
-        let show_depth = false;
+        let shown_preview = None;
         #[cfg(feature = "diagnostics")]
-        let capture_depth = new_depth.is_some()
-            && p.saved_depth_frames < 3
-            && crate::capture::folder().is_some();
+        let capture_preview = new_preview.is_some_and(|(_, color)| {
+            p.saved_preview_frames[usize::from(color)] < 3 && crate::capture::folder().is_some()
+        });
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -1678,7 +1685,7 @@ impl Host {
                 ),
             ]);
             #[cfg(feature = "diagnostics")]
-            if let Some(upload) = &p.depth_upload {
+            if let Some(upload) = &p.preview_upload {
                 upload.copy_to(list, &back);
             } else {
                 list.CopyResource(&back, texture);
@@ -1686,18 +1693,18 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = (capture_depth || crate::capture::wanted(frame))
+            let capture = (capture_preview || crate::capture::wanted(frame))
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = (!show_depth)
+            let probe = shown_preview.is_none()
                 .then(|| crate::capture::probe(&self.device, list, texture))
                 .flatten();
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             let back_state = D3D12_RESOURCE_STATE_COPY_DEST;
             #[cfg(feature = "diagnostics")]
-            let (depth_capture, back_state) = if capture_depth {
+            let (preview_capture, back_state) = if capture_preview {
                 list.ResourceBarrier(&[transition(
                     &back,
                     back_state,
@@ -1717,7 +1724,7 @@ impl Host {
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
-            let completed = (capture.is_some() || new_depth.is_some()) && self.capture_completed();
+            let completed = (capture.is_some() || new_preview.is_some()) && self.capture_completed();
             #[cfg(feature = "diagnostics")]
             if completed
                 && let Some((buffer, footprint)) = capture
@@ -1730,18 +1737,21 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if completed
                 && status == windows::Win32::Foundation::S_OK
-                && let Some(depth_frame) = new_depth
+                && let Some((source_frame, color)) = new_preview
             {
-                tracing::info!(
-                    frame, depth_frame, width, height, native_format = desc.Format.0,
-                    "live scene depth presented to game window"
-                );
-                if let Some((buffer, footprint)) = depth_capture {
-                    crate::capture::save_presented_depth(frame, &buffer, &footprint);
-                    p.saved_depth_frames += 1;
+                if color {
+                    tracing::info!(frame, source_frame, width, height, native_format = desc.Format.0,
+                        "live scene color presented to game window");
+                } else {
+                    tracing::info!(frame, depth_frame = source_frame, width, height, native_format = desc.Format.0,
+                        "live scene depth presented to game window");
+                }
+                if let Some((buffer, footprint)) = preview_capture {
+                    crate::capture::save_presented_preview(frame, color, &buffer, &footprint);
+                    p.saved_preview_frames[usize::from(color)] += 1;
                 }
             }
-            p.meter.frame(p.hwnd, show_depth);
+            p.meter.frame(p.hwnd, shown_preview);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -1790,9 +1800,9 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 #[cfg(feature = "diagnostics")]
-                depth_upload: None,
+                preview_upload: None,
                 #[cfg(feature = "diagnostics")]
-                saved_depth_frames: 0,
+                saved_preview_frames: [0; 2],
             })
         }
     }

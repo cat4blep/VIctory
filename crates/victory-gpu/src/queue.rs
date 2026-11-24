@@ -288,6 +288,8 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        #[cfg(feature = "diagnostics")]
+        crate::scene_color::sample(host, frame, resource as usize);
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
