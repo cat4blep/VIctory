@@ -27,6 +27,7 @@ use windows_sys::Win32::System::LibraryLoader::{
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+const EXCEPTION_NONCONTINUABLE: u32 = 1;
 /// Frames listed per report.
 pub(crate) const MAX_FRAMES: usize = 40;
 
@@ -149,7 +150,10 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
+            [0x0f, 0x01, 0xfc] => {
+                return record.ExceptionFlags & EXCEPTION_NONCONTINUABLE == 0
+                    && crate::clzero::emulate(context);
+            }
             [0x0f, 0x01, 0xfa] => {}
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             _ => {
