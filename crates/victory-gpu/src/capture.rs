@@ -398,11 +398,17 @@ const SLOT: u64 = 512;
 
 /// Records copies of a grid of pixels of `texture` (8-bit color, in the
 /// copy-source state) into a readback buffer, to tell black frames.
+/// `VICTORY_CAPTURE_FAST=1` skips this probe. Selected PNG captures use
+/// their own readback.
 pub(crate) fn probe(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<ID3D12Resource> {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FAST.get_or_init(|| matches!(std::env::var("VICTORY_CAPTURE_FAST").as_deref(), Ok("1"))) {
+        return None;
+    }
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) {
